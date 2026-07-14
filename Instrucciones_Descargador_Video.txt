@@ -1,0 +1,268 @@
+INSTRUCCIONES PARA CONSTRUIR UN DESCARGADOR DE VIDEO
+Plataforma objetivo: YoutubeFake (plataforma propia / con autorizacion explicita)
+Fecha: 2026-04-26
+
+==============================================================================
+AVISO LEGAL PREVIO
+==============================================================================
+Aunque la plataforma sea de un conocido y se cuente con autorizacion verbal
+o escrita, es obligatorio:
+  1. Tener permiso POR ESCRITO para acceso masivo/automatizado a los recursos.
+  2. Respetar robots.txt y headers de rate-limit (Retry-After).
+  3. No distribuir claves de API, tokens de firma ni algoritmos de ofuscacion
+     en repositorios publicos.
+  4. Cumplir con las licencias de codigo de terceros si se reutiliza.
+
+==============================================================================
+FASE 1: RECONOCIMIENTO DE LA PLATAFORMA
+==============================================================================
+Antes de escribir codigo, entender como entrega video la plataforma.
+
+Herramientas necesarias:
+  - Navegador Chrome/Firefox con DevTools (F12 -> Network -> Media/Fetch/XHR)
+  - curl o HTTPie para replicar solicitudes manualmente
+  - yt-dlp (modo verbose) como referencia de arquitectura de extractores
+
+Pasos:
+  1. Reproducir un video en el navegador.
+  2. Filtrar en DevTools por:
+       - .mpd   (manifest DASH)
+       - .m3u8  (playlist HLS)
+       - .m4s   (segmentos DASH)
+       - .ts    (segmentos HLS)
+       - fetch/xhr que devuelvan JSON con URLs firmadas
+  3. Analizar parametros de query:
+       sig, sp, expire, itag, mime, range, rn, rbuf, etc.
+  4. Identificar si el reproductor inyecta datos via:
+       - <script>window.__INITIAL_DATA__ = {...}</script>
+       - API REST separada (ej. /api/player?videoId=...)
+       - GraphQL
+  5. Documentar headers obligatorios:
+       User-Agent, Accept-Language, Origin, Referer, cookies de sesion.
+
+Resultado esperado:
+  - Un mapa de endpoints clave.
+  - Estructura del JSON/HTML que contiene las URLs de streaming.
+  - Lista de formatos disponibles (itags o equivalentes).
+
+==============================================================================
+FASE 2: ARQUITECTURA DEL PROGRAMA
+==============================================================================
+El sistema se divide en 4 capas independientes:
+
+  A. EXTRACTOR (Metadata)
+     Responsabilidad: Dada una URL, obtener titulo, autor, duracion y lista
+     de formatos con sus URLs directas o manifests.
+
+     Flujo:
+       Entrada: URL del video
+       -> HTTP GET a la pagina (con headers identicos a navegador)
+       -> Parsear HTML/JSON para extraer player response
+       -> Extraer array de "formats" y "adaptiveFormats"
+       -> Si hay firmas (sig/n), resolverlas (JS o port del algoritmo)
+       -> Salida: Objeto {video_id, title, author, duration, formats[]}
+
+     Consideraciones:
+       - Si los datos se inyectan con JS dinamico, usar Playwright o
+         analizar el bundle del reproductor para encontrar el JSON inicial.
+       - Si requiere autenticacion, gestionar sesiones (cookies/JWT).
+
+  B. SELECTOR DE FORMATO
+     El usuario elige calidad. Cada formato debe indicar:
+       - resolucion (ej. 1920x1080)
+       - codec de video (avc1, vp9, av01)
+       - codec de audio (mp4a, opus)
+       - contenedor (mp4, webm, m4a)
+       - bitrate aproximado
+       - si incluye audio integrado o es video/audio por separado
+
+     Regla de decision:
+       - Si existe formato "muxed" (video+audio juntos) -> descarga directa.
+       - Si solo existen pistas separadas (DASH) -> descargar ambas y unir.
+
+  C. DOWNLOADER (HTTP Segment Fetcher)
+     Responsabilidad: traer bytes de forma fiable y eficiente.
+
+     Modos de operacion:
+       1. Descarga directa (archivo completo):
+          - Usar HTTP Range requests para soportar reanudacion.
+          - Guardar en archivo temporal .part hasta finalizar.
+
+       2. Descarga por segmentos (DASH/HLS):
+          - Parsear manifest .mpd o .m3u8.
+          - Extraer lista ordenada de segmentos.
+          - Descargar N segmentos en paralelo (4-8 hilos).
+          - Concatenar en orden al archivo final.
+
+     Optimizaciones:
+       - Conexion persistente (HTTP keep-alive).
+       - Reintentos con backoff exponencial ante 429/503.
+       - Verificacion de tamano por segmento.
+       - Barra de progreso actualizada por chunk.
+
+  D. REMUXER (Post-procesamiento)
+     Si se descargaron video y audio por separado, unirlos sin re-encodear.
+
+     Comando FFmpeg tipico:
+       ffmpeg -i video.webm -i audio.webm -c copy output.mkv
+
+     Si los codecs no son compatibles con el contenedor destino:
+       ffmpeg -i video.webm -i audio.webm -c:v copy -c:a aac output.mp4
+
+==============================================================================
+FASE 3: STACK TECNOLOGICO RECOMENDADO
+==============================================================================
+| Componente        | Opcion recomendada          | Justificacion              |
+|-------------------|-----------------------------|----------------------------|
+| Lenguaje          | Python 3.11+                | Ecosistema maduro          |
+| HTTP sync         | requests                    | Simple para prototipos     |
+| HTTP async        | httpx o aiohttp             | Descargas concurrentes     |
+| Parsing HTML      | beautifulsoup4 + lxml       | Rapido y flexible          |
+| Parsing JSON      | orjson                      | Alto rendimiento           |
+| CLI               | typer o click               | UX profesional             |
+| Progreso          | rich + tqdm                 | Barras visuales elegantes  |
+| Remuxing          | ffmpeg-python (wrapper)     | Control desde Python       |
+| Config/Validacion | pydantic                    | Settings tipados           |
+| Tests             | pytest + pytest-httpx       | Mocks de red               |
+
+==============================================================================
+FASE 4: FLUJO DE CONSTRUCCION PASO A PASO
+==============================================================================
+
+--- PASO 1: Modulo extractor.py ---
+
+Funciones minimas:
+  def extract_info(url: str, headers: dict) -> dict:
+      # 1. GET a la URL
+      # 2. Extraer JSON inicial del HTML (regex o parser)
+      # 3. Normalizar estructura de formats[]
+      # 4. Retornar diccionario estandarizado
+
+  def parse_formats(raw_formats: list) -> list:
+      # Normalizar campos: itag, url, mimeType, bitrate, width, height,
+      # qualityLabel, audioChannels, etc.
+
+Manejo de errores:
+  - Video no encontrado -> raise VideoUnavailable
+  - Contenido restringido -> raise AgeRestrictedError
+  - Timeout de red -> retry con backoff
+
+--- PASO 2: Modulo downloader.py ---
+
+Funciones minimas:
+  def download_file(url: str, output_path: Path, headers: dict,
+                    chunk_size: int = 8192) -> Path:
+      # Descarga con streaming, resume soportado via Range.
+
+  def download_segments(segment_urls: list, output_path: Path,
+                        headers: dict, max_workers: int = 4) -> Path:
+      # Usar ThreadPoolExecutor o asyncio.gather.
+      # Escribir cada segmento en orden al archivo final.
+
+  def get_segment_urls_from_mpd(mpd_url: str) -> list:
+      # Parsear XML del manifest DASH.
+      # Extraer BaseURL + SegmentTemplate -> generar lista de URLs.
+
+  def get_segment_urls_from_m3u8(m3u8_url: str) -> list:
+      # Parsear playlist HLS (manejar variantes y AES-128 si aplica).
+
+--- PASO 3: Modulo merger.py ---
+
+Funciones minimas:
+  def merge_streams(video_path: Path, audio_path: Path,
+                    output_path: Path, container: str = "mkv") -> Path:
+      # Construir comando ffmpeg subprocess.
+      # Verificar codigo de retorno.
+      # Limpiar archivos temporales si exito.
+
+  def extract_audio_only(input_path: Path, output_path: Path) -> Path:
+      # ffmpeg -i input -vn -c:a copy output.m4a
+
+--- PASO 4: CLI principal (main.py) ---
+
+Argumentos minimos:
+  python main.py <URL> [OPTIONS]
+    --format, -f          Seleccionar itag o calidad (best, worst, 1080p)
+    --output, -o          Directorio de salida
+    --audio-only          Descargar solo pista de audio
+    --subs                Incluir subtitulos si estan disponibles
+    --threads, -t         Numero de conexiones paralelas (default: 4)
+    --verbose, -v         Modo debug
+
+Flujo de orquestacion:
+  1. Validar URL con pydantic/regex.
+  2. Llamar extract_info(url).
+  3. Mostrar tabla de formatos disponibles (rich.table).
+  4. Seleccionar formato segun criterio del usuario.
+  5. Si es DASH separado:
+       -> download_segments(video_url) -> video.tmp
+       -> download_segments(audio_url) -> audio.tmp
+       -> merge_streams(video.tmp, audio.tmp, output)
+     Si es archivo unico:
+       -> download_file(url, output)
+  6. Verificar archivo final (tamano, duracion con ffprobe opcional).
+  7. Reportar exito o error.
+
+--- PASO 5: Tests ---
+
+Estrategia:
+  - Unitarios: mocks de respuestas HTTP con pytest-httpx.
+  - Integracion: descargar un video de prueba de 5 segundos subido a
+    la plataforma propia.
+  - Edge cases:
+      * Video sin formato de audio (mudo)
+      * Manifest con segmentos faltantes
+      * Rate limit simulado (HTTP 429)
+
+==============================================================================
+FASE 5: CONSIDERACIONES DE PRODUCCION
+==============================================================================
+
+Seguridad y etica:
+  - No incluir credenciales en el codigo; usar variables de entorno.
+  - Respetar limites de concurrencia para no saturar servidores del amigo.
+  - Implementar logging estructurado (no loguear tokens ni cookies).
+
+Robustez:
+  - Cachear manifests por 60-120 segundos para evitar re-descargas.
+  - Usar archivos .part durante descarga; renombrar al finalizar.
+  - Manejar interrupciones (Ctrl+C) para no dejar basura temporal.
+
+Empaquetado:
+  - requirements.txt o pyproject.toml con dependencias fijas.
+  - Incluir instrucciones de instalacion de FFmpeg en README.
+  - Script de instalacion para Windows (.bat) y Unix (.sh).
+
+==============================================================================
+EJEMPLO DE ESTRUCTURA DE CARPETAS
+==============================================================================
+
+youtubefake-downloader/
+|-- src/
+|   |-- __init__.py
+|   |-- extractor.py
+|   |-- downloader.py
+|   |-- merger.py
+|   |-- models.py          # pydantic models
+|   |-- utils.py           # helpers, sanitizacion de nombres
+|   |-- exceptions.py      # clases de error personalizadas
+|-- tests/
+|   |-- test_extractor.py
+|   |-- test_downloader.py
+|   |-- fixtures/
+|-- main.py
+|-- requirements.txt
+|-- README.md
+
+==============================================================================
+REFERENCIAS Y HERRAMIENTAS EXTERNAS
+==============================================================================
+  - FFmpeg: https://ffmpeg.org/download.html
+  - yt-dlp (referencia de arquitectura): https://github.com/yt-dlp/yt-dlp
+  - httpx: https://www.python-httpx.org/
+  - rich: https://rich.readthedocs.io/
+  - pydantic: https://docs.pydantic.dev/
+
+==============================================================================
+FIN DEL DOCUMENTO
+==============================================================================
